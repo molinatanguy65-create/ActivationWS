@@ -1,0 +1,349 @@
+﻿===============================================================================
+  ActivationWs v0.85.0 (ASP.NET Core 8) - Guide d'installation et de configuration
+  Hébergement sur IIS (Windows Server)
+===============================================================================
+
+Sources compilées  : D:\Project\activationws-main\publish
+
+Conventions        : les commandes sont à lancer dans PowerShell en ADMINISTRATEUR.
+                     Remplacer les valeurs entre <...> par les vôtres.
+
+
+-------------------------------------------------------------------------------
+ 0. VUE D'ENSEMBLE
+-------------------------------------------------------------------------------
+
+  Postes clients                Serveur ActivationWs (IIS)          Microsoft
+  Activate-Product.ps1  ---->   http://<serveur>:<port>     ---->   https://activation.sls.microsoft.com
+  (installe la MAK,             /api/ActivationService/              (BatchActivation)
+   demande le CID)              ConfirmationID
+                                + base SQLite ActivationWs.db
+
+  - Le serveur doit pouvoir joindre https://activation.sls.microsoft.com (port 443),
+    directement ou via un proxy (voir étape 6).
+  - Les postes clients doivent pouvoir joindre le serveur ActivationWs sur le port choisi.
+
+
+-------------------------------------------------------------------------------
+ 1. PRÉREQUIS À TÉLÉCHARGER
+-------------------------------------------------------------------------------
+
+  a) ASP.NET Core 8.0 Hosting Bundle (installeur hors ligne, environ 100 Mo)
+     Page     : https://dotnet.microsoft.com/download/dotnet/8.0
+     Colonne  : "ASP.NET Core Runtime 8.0.x" > ligne Windows > lien "Hosting Bundle"
+     Fichier  : dotnet-hosting-8.0.xx-win.exe
+
+     ATTENTION : le fichier "aspnetcore-runtime-8.0.xx-win-x64.exe" ne suffit PAS
+     pour IIS. Il n'installe pas le module IIS (AspNetCoreModuleV2) ni le
+     runtime .NET de base. Il faut bien le "Hosting Bundle".
+
+     Remarque : le support de .NET 8 s'est terminé le 10/11/2026 (plus de
+     correctifs de sécurité). L'application fonctionne, mais une recompilation
+     vers .NET 10 est recommandée pour un usage durable.
+
+  b) Rien d'autre côté serveur. IIS est une fonctionnalité de Windows.
+
+
+-------------------------------------------------------------------------------
+ 2. INSTALLER IIS (AVANT le Hosting Bundle)
+-------------------------------------------------------------------------------
+
+  Windows Server :
+
+    Install-WindowsFeature Web-Server, Web-Mgmt-Console
+
+  Windows 10/11 (poste de test) :
+
+    Enable-WindowsOptionalFeature -Online -FeatureName IIS-WebServerRole, IIS-WebServer, IIS-ManagementConsole -All
+
+  Aucun module ASP.NET 4.x n'est nécessaire pour la v0.85.
+
+
+-------------------------------------------------------------------------------
+ 3. INSTALLER LE HOSTING BUNDLE
+-------------------------------------------------------------------------------
+
+  Interactif   : double-cliquer sur dotnet-hosting-8.0.xx-win.exe
+  Silencieux   : .\dotnet-hosting-8.0.xx-win.exe /install /quiet /norestart /log C:\Temp\hosting-bundle.log
+                 (code de retour 0 = succès ; fonctionne aussi à distance, sans session ouverte)
+
+  Si IIS héberge déjà un site ConfigMgr (point de gestion / distribution) :
+  l'installation et le redémarrage de WAS ci-dessous le coupent quelques
+  secondes, sans autre effet. Testé sur un site ConfigMgr 2509.
+
+  - Si IIS est déjà installé, l'installeur redémarre IIS lui-même si besoin.
+  - Si IIS a été installé APRÈS le Hosting Bundle : relancer l'installeur et
+    choisir "Réparer", sinon le module IIS n'est pas enregistré.
+  - Pour que IIS voie le nouveau PATH système (recommandé) :
+
+      net stop was /y
+      net start w3svc
+
+    (Redémarre tous les pools IIS : à faire pendant un créneau calme si le
+     serveur héberge d'autres sites.)
+
+  Vérification :
+
+      dotnet --list-runtimes
+      # Doit afficher Microsoft.AspNetCore.App 8.0.xx et Microsoft.NETCore.App 8.0.xx
+
+      Get-WebGlobalModule | Where-Object Name -like "AspNetCoreModule*"
+      # Doit afficher AspNetCoreModuleV2
+
+
+-------------------------------------------------------------------------------
+ 4. COPIER L'APPLICATION
+-------------------------------------------------------------------------------
+
+  Copier TOUT le contenu de D:\Project\activationws-main\publish vers le
+  dossier du site, par exemple :
+
+      New-Item -ItemType Directory -Path C:\inetpub\ActivationWs -Force
+      Copy-Item -Path "D:\Project\activationws-main\publish\*" -Destination C:\inetpub\ActivationWs -Recurse -Force
+
+  Le fichier ActivationWs.deps.zip présent dans le dossier publish n'est pas
+  issu de la compilation et n'est pas nécessaire. Il peut être exclu de la copie.
+
+  Créer le dossier des logs de diagnostic :
+
+      New-Item -ItemType Directory -Path C:\inetpub\ActivationWs\logs -Force
+
+
+-------------------------------------------------------------------------------
+ 5. CRÉER LE POOL ET LE SITE IIS
+-------------------------------------------------------------------------------
+
+  Import-Module WebAdministration
+
+  # Pool d'applications : "Pas de code managé" (obligatoire pour ASP.NET Core)
+  New-WebAppPool -Name "ActivationWs"
+  Set-ItemProperty IIS:\AppPools\ActivationWs -Name managedRuntimeVersion -Value ""
+  Set-ItemProperty IIS:\AppPools\ActivationWs -Name startMode -Value "AlwaysRunning"
+  Set-ItemProperty IIS:\AppPools\ActivationWs -Name processModel.idleTimeout -Value "00:00:00"
+
+  # Site sur un port dédié (exemple : 8080)
+  New-Website -Name "ActivationWs" -PhysicalPath "C:\inetpub\ActivationWs" `
+              -ApplicationPool "ActivationWs" -Port 8080
+
+  # Autoriser le port dans le pare-feu Windows
+  New-NetFirewallRule -DisplayName "ActivationWs (TCP 8080)" -Direction Inbound `
+                      -Protocol TCP -LocalPort 8080 -Action Allow
+
+  Variante HTTPS (recommandée si le réseau n'est pas de confiance) :
+  ajouter une liaison https avec un certificat du serveur dans le Gestionnaire
+  IIS (Site > Liaisons > Ajouter > https). L'application redirige alors
+  automatiquement HTTP vers HTTPS. Sans liaison HTTPS, elle reste en HTTP
+  (un avertissement "Failed to determine the https port" dans les logs est normal).
+
+
+-------------------------------------------------------------------------------
+ 6. PERMISSIONS (OBLIGATOIRE : base SQLite)
+-------------------------------------------------------------------------------
+
+  Au premier démarrage, l'application crée la base ActivationWs.db (et ses
+  fichiers -wal / -shm) DANS le dossier du site. L'identité du pool doit donc
+  avoir le droit Modification sur ce dossier :
+
+      icacls "C:\inetpub\ActivationWs" /grant "IIS AppPool\ActivationWs:(OI)(CI)M"
+
+  Sans ce droit : erreur 500.30 au démarrage ("unable to open database file").
+
+  Option : placer la base ailleurs (ex. D:\ActivationWsData) en modifiant la
+  chaîne de connexion à l'étape 7, et donner le même droit sur ce dossier.
+
+
+-------------------------------------------------------------------------------
+ 7. CONFIGURATION : appsettings.json
+-------------------------------------------------------------------------------
+
+  Fichier : C:\inetpub\ActivationWs\appsettings.json
+
+  {
+    "ConnectionStrings": {
+      "DefaultConnection": "Data Source=ActivationWs.db"
+    },
+    "Logging": {
+      "LogLevel": {
+        "Default": "Information",
+        "Microsoft.AspNetCore": "Warning",
+        "Microsoft.EntityFrameworkCore": "Warning"
+      }
+    },
+    "AllowedHosts": "*",
+    "ActivationService": {
+      "TimeoutSeconds": 30,
+      "Proxy": {
+        "UseProxy": false,
+        "Address": "",
+        "BypassOnLocal": true,
+        "UseDefaultCredentials": false,
+        "Username": "",
+        "Password": "",
+        "Domain": ""
+      }
+    }
+  }
+
+  Paramètres :
+
+  ConnectionStrings:DefaultConnection
+      Emplacement de la base SQLite. Chemin relatif = dossier du site.
+      Exemple absolu : "Data Source=D:\\ActivationWsData\\ActivationWs.db"
+      (doubler les antislashs en JSON)
+
+  ActivationService:TimeoutSeconds
+      Délai d'attente des appels au service Microsoft, entre 1 et 300 secondes.
+      Une valeur hors plage empêche l'application de démarrer.
+
+  ActivationService:Proxy  (si le serveur sort sur Internet via un proxy)
+      UseProxy              true pour activer le proxy
+      Address               URL COMPLÈTE du proxy, ex. "http://proxy.corp.local:8080"
+                            (une adresse sans http:// empêche le démarrage)
+      BypassOnLocal         true = pas de proxy pour les adresses locales
+      UseDefaultCredentials true = authentification avec le compte du pool IIS
+      Username / Password / Domain
+                            compte explicite pour le proxy, si
+                            UseDefaultCredentials = false
+
+      Exemple :
+        "Proxy": {
+          "UseProxy": true,
+          "Address": "http://proxy.corp.local:8080",
+          "BypassOnLocal": true,
+          "UseDefaultCredentials": false,
+          "Username": "svc-activationws",
+          "Password": "<mot de passe>",
+          "Domain": "CORP"
+        }
+
+      Sécurité : le mot de passe est en clair dans le fichier. Limiter les droits
+      NTFS du fichier aux administrateurs et au pool IIS, ou préférer
+      UseDefaultCredentials avec un pool qui tourne sous un compte de service.
+
+  AllowedHosts
+      "*" accepte tous les noms d'hôte. Pour restreindre :
+      "activationws.corp.local;srv-actws01"
+
+  Après toute modification d'appsettings.json, recycler le pool :
+
+      Restart-WebAppPool -Name "ActivationWs"
+
+
+-------------------------------------------------------------------------------
+ 8. (RECOMMANDÉ) web.config : chemin absolu de dotnet
+-------------------------------------------------------------------------------
+
+  Le web.config publié lance "dotnet" via le PATH système. Pour ne pas en
+  dépendre, remplacer dans C:\inetpub\ActivationWs\web.config :
+
+      processPath="dotnet"
+  par
+      processPath="C:\Program Files\dotnet\dotnet.exe"
+
+
+-------------------------------------------------------------------------------
+ 9. VÉRIFICATION
+-------------------------------------------------------------------------------
+
+  1. Ouvrir http://<serveur>:8080/ dans un navigateur
+     -> la page d'accueil ActivationWs (récupération manuelle du CID) s'affiche.
+  2. Ouvrir http://<serveur>:8080/Reporting
+     -> la page de suivi des activations s'affiche (vide au départ).
+  3. Vérifier que C:\inetpub\ActivationWs\ActivationWs.db a été créé.
+  4. Depuis le serveur, tester l'accès à Microsoft (via le proxy si besoin) :
+
+       Test-NetConnection activation.sls.microsoft.com -Port 443
+
+  5. Test de bout en bout jusqu'à Microsoft, sans clé MAK (identifiants fictifs) :
+
+       Invoke-WebRequest -UseBasicParsing "http://localhost:8080/api/ActivationService/ConfirmationId?hostName=test&installationId=111111111111111111111111111111111111111111111111111111111111111&extendedProductId=00000-00000-000-000000-00-1033-26100.0000-0000000"
+
+     Résultat attendu : HTTP 409 avec "BasException" et "Please check the
+     Installation ID and try again." C'est la réponse de MICROSOFT : la chaîne
+     serveur -> proxy -> HTTPS -> service d'activation fonctionne.
+     Un délai d'attente ou une erreur réseau indique au contraire un problème
+     de proxy ou de pare-feu sortant.
+
+  API utilisée par le script client :
+      GET /api/ActivationService/ConfirmationId?hostName=..&installationId=..&extendedProductId=..
+      GET /api/ActivationService/ActivationCount?extendedProductID=..
+          (sans paramètre : HTTP 400, normal)
+
+  Note SSL : la v0.85 n'a PAS besoin du correctif de la PR 21. Testée le
+  23/11/2026 sans proxy : connexion HTTPS au service Microsoft sans erreur de
+  certificat.
+
+
+-------------------------------------------------------------------------------
+ 10. DÉPLOIEMENT SUR LES POSTES CLIENTS
+-------------------------------------------------------------------------------
+
+  Prérequis postes :
+  - Windows PowerShell 3.0 ou plus, exécution en administrateur (ou SYSTEM).
+  - Pour les clés ESU : mises à jour préalables ESU installées selon l'OS.
+    Liens dans le README du projet, section "Installation and Usage".
+
+  Script : D:\Project\activationws-main\src\Activate-Product.ps1
+
+  Installation + activation :
+      .\Activate-Product.ps1 -ProductKey XXXXX-XXXXX-XXXXX-XXXXX-XXXXX `
+                             -WebServiceUrl http://<serveur>:8080
+
+  Options :
+      -MaximumRetryCount <n>    tentatives si le serveur est injoignable (défaut 3)
+      -RetryIntervalSec <s>     intervalle entre tentatives (défaut 30)
+      -SkipActivation           installer la clé sans l'activer
+      -Uninstall                désinstaller la clé
+      -LogFile <chemin>         fichier de log, ex. C:\Windows\Temp\activation.log
+
+  Attention : le script refuse les clés KMS (GVLK) avec le code 15, et
+  Microsoft rejette toute clé qui n'est pas une MAK ("The product key has been
+  blocked", code 22). Il ne fonctionne qu'avec une vraie clé MAK ou ESU.
+
+  Codes de retour (pour SCCM / Intune) :
+      0   Succès
+      1   Erreur inconnue
+      10  Échec d'installation de la clé
+      11  Produit introuvable
+      13  Échec d'activation
+      15  Produit non pris en charge pour l'activation
+      20  Nombre maximum de tentatives atteint
+      21  Exception lors de l'appel au serveur ActivationWs
+      22  Le service d'activation Microsoft a signalé un problème
+      50  Échec de désinstallation de la clé
+
+  Exemple de ligne de commande pour un déploiement SCCM / Intune :
+      powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\Activate-Product.ps1 -ProductKey XXXXX-XXXXX-XXXXX-XXXXX-XXXXX -WebServiceUrl http://<serveur>:8080
+
+  Activation manuelle (poste sans réseau) :
+      1. Sur le poste : récupérer l'Installation ID et l'Extended Product ID
+         (slmgr.vbs /dti <Activation ID>  et  slmgr.vbs /dlv)
+      2. Sur la page d'accueil ActivationWs : saisir le nom d'hôte, l'Installation ID
+         et l'Extended Product ID -> obtenir le Confirmation ID
+      3. Sur le poste : slmgr.vbs /atp <Confirmation ID> <Activation ID>
+
+
+-------------------------------------------------------------------------------
+ 11. DÉPANNAGE
+-------------------------------------------------------------------------------
+
+  Activer les logs détaillés : dans web.config, passer stdoutLogEnabled="true",
+  recycler le pool, reproduire, puis lire C:\inetpub\ActivationWs\logs\stdout_*.log.
+  Le remettre à "false" ensuite (les fichiers grossissent sans limite).
+
+  Journal d'événements : Observateur d'événements > Journaux Windows > Application,
+  source "IIS AspNetCore Module V2".
+
+  500.19          Module IIS absent -> installer ou réparer le Hosting Bundle (étape 3).
+  500.30          L'application plante au démarrage. Causes fréquentes :
+                  - droits insuffisants sur le dossier (étape 6) ;
+                  - appsettings.json invalide (virgule, antislash non doublé,
+                    TimeoutSeconds hors 1-300, adresse de proxy sans http://).
+  500.31          Runtime .NET 8 introuvable -> Hosting Bundle 8.0 non installé,
+                  ou IIS non redémarré (net stop was /y ; net start w3svc).
+  502.5 / 500.0   dotnet introuvable -> étape 8 (chemin absolu).
+  Code 21 client  Le poste ne joint pas le serveur : pare-feu, port, URL.
+  Code 22 client  Le serveur ne joint pas Microsoft, ou Microsoft refuse :
+                  vérifier proxy (étape 7) et Test-NetConnection (étape 9).
+
+===============================================================================
